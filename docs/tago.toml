@@ -1,0 +1,10 @@
+title       = "clevelandart"
+baseURL     = "https://clevelandart-cli.tamnd.com/"
+description = "A command line for clevelandart."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/clevelandart-cli"
