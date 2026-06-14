@@ -1,60 +1,76 @@
 // Package clevelandart is the library behind the clevelandart command line:
-// the HTTP client, request shaping, and the typed data models for clevelandart.
+// the HTTP client, request shaping, and the typed data models for the
+// Cleveland Museum of Art open access API.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package clevelandart
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to clevelandart. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "clevelandart/dev (+https://github.com/tamnd/clevelandart-cli)"
+// DefaultUserAgent identifies the client to the Cleveland Museum of Art API.
+const DefaultUserAgent = "clevelandart-cli/dev (+https://github.com/tamnd/clevelandart-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at clevelandart.com; change it once you
-// know the real endpoints you want to read.
-const Host = "clevelandart.com"
+// APIBase is the root every API request is built from.
+const APIBase = "https://openaccess-api.clevelandart.org/api"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// SiteBase is the public site root, used for constructing human-facing URLs.
+const SiteBase = "https://clevelandart.org/art"
 
-// Client talks to clevelandart over HTTP.
+// Host is the site this client is associated with.
+const Host = "clevelandart.org"
+
+// Config holds the tunable client settings.
+type Config struct {
+	Rate    time.Duration
+	Retries int
+	Timeout time.Duration
+}
+
+// DefaultConfig returns sensible defaults: 200ms pacing, 3 retries, 15s timeout.
+func DefaultConfig() Config {
+	return Config{
+		Rate:    200 * time.Millisecond,
+		Retries: 3,
+		Timeout: 15 * time.Second,
+	}
+}
+
+// Client talks to the Cleveland Museum of Art open access API.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+	Rate      time.Duration
+	Retries   int
 
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with the defaults from DefaultConfig.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Get fetches url and returns the response body. It paces and retries
+// according to the client's settings.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +80,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,12 +89,12 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -123,78 +139,214 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on clevelandart.com. It is a stand-in for the typed records you
-// will model from the real clevelandart endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `clevelandart cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- Output types ---
+
+// Artwork is a single artwork record from the Cleveland Museum of Art.
+type Artwork struct {
+	ID         int    `json:"id" kit:"id"`
+	Accession  string `json:"accession_number"`
+	Title      string `json:"title"`
+	Date       string `json:"date"`
+	Type       string `json:"type"`
+	Medium     string `json:"medium"`
+	Artist     string `json:"artist"`
+	Department string `json:"department"`
+	URL        string `json:"url"`
+	ImageURL   string `json:"image_url"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
+// Creator is an artist or creator record.
+type Creator struct {
+	ID          int    `json:"id" kit:"id"`
+	Description string `json:"description"`
+}
+
+// --- Wire types ---
+
+type wireListResponse struct {
+	Data []wireArtwork `json:"data"`
+	Info wireInfo      `json:"info"`
+}
+
+type wireInfo struct {
+	Total  int `json:"total"`
+	Limit  int `json:"limit"`
+	Offset int `json:"offset"`
+}
+
+type wireArtwork struct {
+	ID         int            `json:"id"`
+	Accession  string         `json:"accession_number"`
+	Title      string         `json:"title"`
+	Date       string         `json:"creation_date"`
+	Type       string         `json:"type"`
+	Technique  string         `json:"technique"`
+	Department string         `json:"department"`
+	URL        string         `json:"url"`
+	Creators   []wireCreator  `json:"creators"`
+	Images     wireImages     `json:"images"`
+}
+
+type wireCreator struct {
+	Description string `json:"description"`
+	Role        string `json:"role"`
+}
+
+type wireImages struct {
+	Web *wireImage `json:"web"`
+}
+
+type wireImage struct {
+	URL string `json:"url"`
+}
+
+type wireSingleResponse struct {
+	Data wireArtwork `json:"data"`
+}
+
+type wireCreatorList struct {
+	Data []wireCreatorEntry `json:"data"`
+}
+
+type wireCreatorEntry struct {
+	ID          int    `json:"id"`
+	Description string `json:"description"`
+}
+
+// mapArtwork converts a wireArtwork into an Artwork output record.
+func mapArtwork(w wireArtwork) Artwork {
+	artist := ""
+	if len(w.Creators) > 0 {
+		artist = w.Creators[0].Description
+	}
+	imageURL := ""
+	if w.Images.Web != nil {
+		imageURL = w.Images.Web.URL
+	}
+	return Artwork{
+		ID:         w.ID,
+		Accession:  w.Accession,
+		Title:      w.Title,
+		Date:       w.Date,
+		Type:       w.Type,
+		Medium:     w.Technique,
+		Artist:     artist,
+		Department: w.Department,
+		URL:        w.URL,
+		ImageURL:   imageURL,
+	}
+}
+
+// --- Client methods ---
+
+// SearchArtworks searches for artworks by keyword with optional filters.
+// GET /artworks/?q={query}&type={type}&has_image={1|}&limit={n}
+func (c *Client) SearchArtworks(ctx context.Context, query, artType string, hasImage bool, limit int) ([]Artwork, error) {
+	params := url.Values{}
+	if query != "" {
+		params.Set("q", query)
+	}
+	if artType != "" {
+		params.Set("type", artType)
+	}
+	if hasImage {
+		params.Set("has_image", "1")
+	}
+	if limit > 0 {
+		params.Set("limit", strconv.Itoa(limit))
+	}
+	apiURL := APIBase + "/artworks/?" + params.Encode()
+	return c.searchArtworksURL(ctx, apiURL)
+}
+
+func (c *Client) searchArtworksURL(ctx context.Context, apiURL string) ([]Artwork, error) {
+	body, err := c.Get(ctx, apiURL)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+	var resp wireListResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse artworks response: %w", err)
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+
+	out := make([]Artwork, len(resp.Data))
+	for i, w := range resp.Data {
+		out[i] = mapArtwork(w)
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+// GetArtwork fetches a single artwork by accession number or numeric ID.
+// GET /artworks/{id}
+func (c *Client) GetArtwork(ctx context.Context, id string) (*Artwork, error) {
+	apiURL := APIBase + "/artworks/" + strings.TrimSpace(id)
+	return c.getArtworkURL(ctx, apiURL)
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+func (c *Client) getArtworkURL(ctx context.Context, apiURL string) (*Artwork, error) {
+	body, err := c.Get(ctx, apiURL)
+	if err != nil {
+		return nil, err
 	}
-	return s
+
+	var resp wireSingleResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse artwork response: %w", err)
+	}
+
+	a := mapArtwork(resp.Data)
+	return &a, nil
+}
+
+// SearchCreators searches for creators/artists by keyword.
+// GET /creators/?q={query}&limit={n}
+func (c *Client) SearchCreators(ctx context.Context, query string, limit int) ([]Creator, error) {
+	params := url.Values{}
+	if query != "" {
+		params.Set("q", query)
+	}
+	if limit > 0 {
+		params.Set("limit", strconv.Itoa(limit))
+	}
+	apiURL := APIBase + "/creators/?" + params.Encode()
+	return c.searchCreatorsURL(ctx, apiURL)
+}
+
+func (c *Client) searchCreatorsURL(ctx context.Context, apiURL string) ([]Creator, error) {
+	body, err := c.Get(ctx, apiURL)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp wireCreatorList
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse creators response: %w", err)
+	}
+
+	out := make([]Creator, len(resp.Data))
+	for i, e := range resp.Data {
+		out[i] = Creator{ID: e.ID, Description: e.Description}
+	}
+	return out, nil
+}
+
+// Classify determines the type and canonical id of an input string.
+// - "1926.197" (contains ".") → ("accession", "1926.197")
+// - "436532" (numeric)        → ("id", "436532")
+// - "monet"                   → ("query", "monet")
+func Classify(input string) (uriType, id string) {
+	input = strings.TrimSpace(input)
+	if strings.Contains(input, ".") {
+		return "accession", input
+	}
+	if _, err := strconv.Atoi(input); err == nil {
+		return "id", input
+	}
+	return "query", input
+}
+
+// Locate returns the public site URL for a (type, id) pair.
+func Locate(uriType, id string) string {
+	return SiteBase + "/" + id
 }
